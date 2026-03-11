@@ -184,7 +184,7 @@ export function RosterPanel({ poolId, status, settings, activeTodayIds = [] }: P
               <PlayerRow
                 key={entry.id}
                 entry={entry}
-                isActive={activeSet.has(entry.playerId)}
+                gameStatus={activeSet.has(entry.playerId) ? "played" : null}
                 onRemove={canEdit ? handleRemove : undefined}
                 removing={removingId === entry.id}
               />

@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { InviteCodeDisplay } from "@/components/pools/invite-code-display";
 import { ActivatePoolButton } from "@/components/pools/activate-pool-button";
@@ -40,9 +41,13 @@ type Props = {
   selectedDate: string | null;
   selectedDatePoints: Record<string, Record<string, number>>;
   playerStats: Record<string, Record<string, { goals: number; assists: number }>>;
+  playerTotalStats: Record<string, Record<string, { goals: number; assists: number }>>;
   poolTotalPoints: Record<string, Record<string, number>>;
   activeDateIds: number[];
-  availableDates: string[];
+  activeDateTeamIds: string[];
+  goalieStats: Record<string, { wins: number; saves: number; goalsAgainst: number; shutouts: number }>;
+  today: string;         // server UTC today (used as query date fallback)
+  isExplicitDate: boolean; // true when ?date= param was present in URL
   dailyPointsMap: Record<string, string>;
   globalTopPlayers: TopPlayer[];
 };
@@ -57,12 +62,77 @@ export function PoolPageClient({
   selectedDate,
   selectedDatePoints,
   playerStats,
+  playerTotalStats,
   poolTotalPoints,
   activeDateIds,
-  availableDates,
+  activeDateTeamIds,
+  goalieStats,
+  today,
+  isExplicitDate,
   dailyPointsMap,
   globalTopPlayers,
 }: Props) {
+  const router = useRouter();
+
+  // Compute today in Eastern time — NHL game dates are always Eastern-based.
+  // This keeps "today" consistent with the live route and the NHL schedule,
+  // so isToday stays true until Eastern midnight (not UTC midnight).
+  const [clientToday] = useState(() => {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/New_York",
+    }).format(new Date());
+  });
+
+  // If the viewed date doesn't match the browser's local today (e.g. UTC rollover at night),
+  // redirect to the correct local date. Runs on every soft navigation (selectedDate changes).
+  useEffect(() => {
+    console.log("[DateFix] selectedDate:", selectedDate, "clientToday:", clientToday, "isExplicitDate:", isExplicitDate);
+    if (!isExplicitDate && clientToday !== selectedDate) {
+      console.log("[DateFix] Redirecting to:", clientToday);
+      router.replace(`/pools/${pool.id}?date=${clientToday}`);
+    } else {
+      console.log("[DateFix] No redirect needed.");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isExplicitDate, selectedDate]);
+
+  // Whether the currently viewed date is today (browser local)
+  const isToday = selectedDate === clientToday;
+
+  // Live top performers — polled from the /live API when viewing today.
+  // This is needed because nhl_game_stats only has synced historical data;
+  // for today's games, we must hit the NHL API directly.
+  const [liveTopPerformers, setLiveTopPerformers] = useState<TopPlayer[]>([]);
+
+  useEffect(() => {
+    if (!isToday) {
+      setLiveTopPerformers([]);
+      return;
+    }
+
+    async function fetchTopPerformers() {
+      try {
+        const res = await fetch(`/api/v1/pools/${pool.id}/live`);
+        if (!res.ok) return;
+        const json = await res.json();
+        if (Array.isArray(json.data?.topPerformers)) {
+          setLiveTopPerformers(json.data.topPerformers);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    fetchTopPerformers();
+    const interval = setInterval(fetchTopPerformers, 60_000);
+    return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isToday, pool.id]);
+
+  // For today: use live top performers from NHL API.
+  // For past dates: use server-rendered DB data.
+  const displayedTopPlayers = isToday ? liveTopPerformers : globalTopPlayers;
+
   const [selectedMemberId, setSelectedMemberId] = useState(currentUserId);
 
   const selectedMember = members.find((m) => m.userId === selectedMemberId);
@@ -130,13 +200,13 @@ export function PoolPageClient({
 
         {/* Left: main content */}
         <div className="lg:col-start-1 lg:row-start-1 space-y-6">
-          {/* Date navigation — shown only when there are scored dates */}
-          {availableDates.length > 0 && selectedDate && (
+          {/* Date navigation — always shown */}
+          {selectedDate && (
             <div className="flex items-center justify-between">
               <DateNav
                 poolId={pool.id}
                 selectedDate={selectedDate}
-                availableDates={availableDates}
+                today={clientToday}
               />
               <p className="text-xs text-muted-foreground">
                 Click a member in Standings to view their roster
@@ -156,17 +226,22 @@ export function PoolPageClient({
               selectedDatePoints={selectedDatePoints}
               poolTotalPoints={poolTotalPoints}
               playerStats={playerStats}
+              playerTotalStats={playerTotalStats}
               selectedDate={selectedDate}
               activeDateIds={activeDateIds}
+              activeDateTeamIds={activeDateTeamIds}
+              goalieStats={goalieStats}
+              today={clientToday}
               settings={settings}
             />
           )}
 
           {/* Global top NHL players for selected date */}
-          {selectedDate && globalTopPlayers.length > 0 && (
+          {selectedDate && (displayedTopPlayers.length > 0 || isToday) && (
             <TopPlayersCard
-              players={globalTopPlayers}
+              players={displayedTopPlayers}
               selectedDate={selectedDate}
+              today={clientToday}
             />
           )}
 

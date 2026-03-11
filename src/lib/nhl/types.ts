@@ -90,4 +90,5 @@ export interface GoalieGameStats {
   savePctg?: number;
   decision?: string; // "W", "L", or undefined
   starter?: boolean;
+  toi?: string;      // "MM:SS" — "00:00" for a backup who did not enter the game
 }

@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import React, { useState } from "react";
+import Link from "next/link";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Loader2, X } from "lucide-react";
@@ -10,6 +11,7 @@ export type PlayerRowData = {
   playerId: number;
   playerFullName: string;
   playerPosition: string;
+  playerPositionGroup?: string;
   playerTeamId: string | null;
   playerHeadshotUrl: string | null;
   rosterSlot: string;
@@ -34,7 +36,7 @@ export function PlayerHeadshot({
   size?: "sm" | "md";
 }) {
   const [errored, setErrored] = useState(false);
-  const parts = name.trim().split(/\s+/);
+  const parts = (name ?? "").trim().split(/\s+/);
   const initial =
     (parts.length > 1 ? parts[parts.length - 1] : parts[0])?.[0]?.toUpperCase() ?? "?";
   const dim = size === "sm" ? "size-7" : "size-9";
@@ -88,11 +90,13 @@ function formatAcquiredDate(iso: string): string {
 
 // ── Main component ─────────────────────────────────────────────────────────
 
+export type GameStatus = "live" | "played" | "later" | "scratched" | null;
+
 type Props = {
   entry: PlayerRowData;
   points?: number;                              // undefined = no scoring context
-  stats?: { goals: number; assists: number };   // date mode only, when isActive
-  isActive?: boolean;                           // had stats on selected date
+  stats?: { goals: number; assists: number; wins?: number; saves?: number; goalsAgainst?: number; shutouts?: number };
+  gameStatus?: GameStatus;                      // team game state for selected date
   acquiredDate?: string;                        // ISO timestamp
   pointsMode?: "date" | "total";
   onRemove?: (id: string) => void;
@@ -103,7 +107,7 @@ export function PlayerRow({
   entry,
   points,
   stats,
-  isActive,
+  gameStatus,
   acquiredDate,
   pointsMode,
   onRemove,
@@ -115,33 +119,45 @@ export function PlayerRow({
   };
 
   const hasScoring = points !== undefined;
-  const dateMode = pointsMode === "date";
   const totalMode = pointsMode === "total";
+  const isGoalie = entry.playerPositionGroup === "goalie";
 
-  // Build the info line parts
-  const infoParts: string[] = [];
-
-  if (hasScoring && dateMode && isActive) {
-    const g = stats?.goals ?? 0;
-    const a = stats?.assists ?? 0;
-    infoParts.push(`${points!.toFixed(1)} pts · ${g}G · ${a}A`);
-  } else if (hasScoring && totalMode) {
-    infoParts.push(`${points!.toFixed(1)} pts total`);
+  // Scoring segment — points value gets stronger emphasis via a child span
+  let scoringNode: React.ReactNode = null;
+  if (hasScoring) {
+    const ptVal = (points ?? 0).toFixed(1);
+    const pts = <span className="font-semibold text-foreground">{ptVal} pts{totalMode ? " total" : ""}</span>;
+    if (isGoalie) {
+      if (totalMode) {
+        scoringNode = pts;
+      } else {
+        const w  = stats?.wins ?? 0;
+        const sv = stats?.saves ?? 0;
+        const ga = stats?.goalsAgainst ?? 0;
+        const svPct = sv + ga > 0 ? (sv / (sv + ga)).toFixed(3).replace(/^0/, "") : "---";
+        const so = stats?.shutouts ?? 0;
+        scoringNode = <>{w}W · {svPct} SV% · {so}SO · {pts}</>;
+      }
+    } else {
+      const g = stats?.goals ?? 0;
+      const a = stats?.assists ?? 0;
+      scoringNode = <>{g}G · {a}A · {pts}</>;
+    }
   }
 
-  if (acquiredDate) {
-    infoParts.push(`Added ${formatAcquiredDate(acquiredDate)}`);
-  }
-
-  const infoLine = infoParts.join(" · ");
+  const profileHref = `/players/${entry.playerId}`;
 
   return (
     <div className="flex items-center gap-3 py-2.5">
-      <PlayerHeadshot url={entry.playerHeadshotUrl} name={entry.playerFullName} />
+      <Link href={profileHref} className="shrink-0">
+        <PlayerHeadshot url={entry.playerHeadshotUrl} name={entry.playerFullName} />
+      </Link>
 
       {/* Name + meta */}
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium">{entry.playerFullName}</p>
+        <Link href={profileHref} className="hover:underline">
+          <p className="truncate text-sm font-medium">{entry.playerFullName}</p>
+        </Link>
         <div className="flex items-center gap-1 text-xs text-muted-foreground">
           <span>{entry.playerPosition}</span>
           {entry.playerTeamId && (
@@ -152,18 +168,35 @@ export function PlayerRow({
             </>
           )}
         </div>
-        {infoLine && (
-          <p className="mt-0.5 text-xs text-muted-foreground">{infoLine}</p>
+        {(scoringNode || acquiredDate) && (
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {scoringNode}
+            {scoringNode && acquiredDate && " · "}
+            {acquiredDate && `Added ${formatAcquiredDate(acquiredDate)}`}
+          </p>
         )}
       </div>
 
-      {/* Right cluster: Active badge, slot badge, remove button */}
+      {/* Right cluster: game status badge, slot badge, remove button */}
       <div className="flex items-center gap-1.5 shrink-0">
-        {isActive && (
-          <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
-            Active
+        {gameStatus === "live" ? (
+          <span className="flex items-center gap-1 rounded-full border border-red-500/20 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-400">
+            <span className="size-1.5 rounded-full bg-red-400 animate-pulse" />
+            Live
           </span>
-        )}
+        ) : gameStatus === "played" ? (
+          <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
+            Played
+          </span>
+        ) : gameStatus === "later" ? (
+          <span className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-400">
+            Team plays later
+          </span>
+        ) : gameStatus === "scratched" ? (
+          <span className="rounded-full border border-zinc-500/20 bg-zinc-500/10 px-2 py-0.5 text-[10px] font-medium text-zinc-400">
+            Scratched
+          </span>
+        ) : null}
 
         <span
           className={cn(

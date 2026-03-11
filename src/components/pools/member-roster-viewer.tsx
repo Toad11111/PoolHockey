@@ -102,7 +102,7 @@ export function MemberRosterViewer({
                   <PlayerRow
                     key={entry.id}
                     entry={entry}
-                    isActive={activeSet.has(entry.playerId)}
+                    gameStatus={activeSet.has(entry.playerId) ? "played" : null}
                   />
                 ))}
               </div>

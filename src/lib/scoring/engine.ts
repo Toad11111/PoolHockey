@@ -40,7 +40,8 @@ export async function calculatePoolScores(
 
   if (members.length === 0) return { membersProcessed: 0, scoresWritten: 0 };
 
-  // 2. All roster entries for this pool, joined with player info
+  // 2. Roster entries active on gameDate: only include players added on or before the game date.
+  //    This ensures players cannot earn retroactive points before they were picked up.
   const roster = await db
     .select({
       userId:        rosterEntries.userId,
@@ -51,7 +52,10 @@ export async function calculatePoolScores(
     })
     .from(rosterEntries)
     .innerJoin(nhlPlayers, eq(rosterEntries.playerId, nhlPlayers.id))
-    .where(eq(rosterEntries.poolId, poolId));
+    .where(and(
+      eq(rosterEntries.poolId, poolId),
+      sql`${rosterEntries.addedAt}::date <= ${gameDate}::date`
+    ));
 
   // 3. All game stats for rostered players on this date (single query)
   const playerIds = [...new Set(roster.map((r) => r.playerId))];

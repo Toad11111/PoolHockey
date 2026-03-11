@@ -11,9 +11,11 @@ import {
   nhlPlayers,
   nhlGameStats,
 } from "@/lib/db/schema";
-import { and, eq, max, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 import { PoolPageClient } from "@/components/pools/pool-page-client";
+import { calculatePoolScores } from "@/lib/scoring/engine";
+import { syncStats } from "@/lib/nhl/sync-stats";
 import type { RosterEntryData } from "@/components/pools/roster-view";
 import type { TopPlayer } from "@/components/pools/top-players-card";
 
@@ -23,17 +25,36 @@ type TopPlayerRow = {
   player_id: string;
   full_name: string;
   position: string;
+  position_group: string;
   team_id: string | null;
   headshot_url: string | null;
   fantasy_points: string;
   goals: string;
   assists: string;
+  wins: string;
+  shutouts: string;
+  saves: string;
 };
 
 type PoolTotalRow = {
   user_id: string;
   player_id: string;
   total_points: string;
+};
+
+type TotalStatsRow = {
+  user_id: string;
+  player_id: string;
+  goals: string;
+  assists: string;
+};
+
+type GoalieStatRow = {
+  player_id: string;
+  wins: string;
+  saves: string;
+  goals_against: string;
+  shutouts: string;
 };
 
 // ── Page ──────────────────────────────────────────────────────────────────
@@ -63,23 +84,17 @@ export default async function PoolPage({
   });
   if (!pool) notFound();
 
-  // ── 2. Latest scored date ────────────────────────────────────────────────
+  // ── 2. Today + selected date (defaults to today) ─────────────────────────
 
-  const latestDate: string | null =
-    (
-      await db
-        .select({ gameDate: max(dailyScores.gameDate) })
-        .from(dailyScores)
-        .where(eq(dailyScores.poolId, poolId))
-    )[0]?.gameDate ?? null;
+  // Server uses UTC as a best-effort "today" for queries when no date param is given.
+  // The client (PoolPageClient) computes the real local today and redirects if needed.
+  const today = new Date().toISOString().slice(0, 10);
+  const selectedDate: string = dateParam ?? today;
+  const isExplicitDate = !!dateParam;
 
-  // ── 3. Determine selectedDate (URL param or latestDate) ──────────────────
+  // ── 3. Parallel: members + all rosters ───────────────────────────────────
 
-  const selectedDate: string | null = dateParam ?? latestDate;
-
-  // ── 4. Parallel: members, all rosters, available dates ───────────────────
-
-  const [membersRaw, allRosterEntriesRaw, availableDatesResult] =
+  const [membersRaw, allRosterEntriesRaw] =
     await Promise.all([
       // Members with left-joined total scores
       db
@@ -120,13 +135,6 @@ export default async function PoolPage({
         .innerJoin(nhlPlayers, eq(rosterEntries.playerId, nhlPlayers.id))
         .where(eq(rosterEntries.poolId, poolId))
         .orderBy(rosterEntries.addedAt),
-
-      // Distinct scored dates for this pool (for DateNav)
-      db
-        .selectDistinct({ gameDate: dailyScores.gameDate })
-        .from(dailyScores)
-        .where(eq(dailyScores.poolId, poolId))
-        .orderBy(dailyScores.gameDate),
     ]);
 
   // ── 5. Process members ───────────────────────────────────────────────────
@@ -155,13 +163,47 @@ export default async function PoolPage({
   }
 
   const allPlayerIds = [...new Set(allRosterEntriesRaw.map((e) => e.playerId))];
-  const availableDates = availableDatesResult.map((r) => r.gameDate);
+  const goaliePlayerIds = allRosterEntriesRaw
+    .filter((e) => e.playerPositionGroup === "goalie")
+    .map((e) => e.playerId);
+
+  // ── 6b. Auto-sync stats + calculate scores for selected date if needed ───
+  // Flow:
+  //   1. If nhl_game_stats has no rows for this date → sync from NHL API first.
+  //      (statsJustSynced = true when new data was written)
+  //   2. If daily_scores has no rows, OR stats were just synced (stale zero-rows
+  //      from a previous load-before-stats-existed are now outdated) → recalculate.
+  if (selectedDate <= today && allPlayerIds.length > 0) {
+    let statsJustSynced = false;
+
+    const [existingStat] = await db
+      .select({ playerId: nhlGameStats.playerId })
+      .from(nhlGameStats)
+      .where(eq(nhlGameStats.gameDate, selectedDate))
+      .limit(1);
+
+    if (!existingStat) {
+      try {
+        const result = await syncStats(selectedDate);
+        statsJustSynced = result.gamesProcessed > 0;
+      } catch { /* non-fatal */ }
+    }
+
+    const [existingScore] = statsJustSynced ? [null] : await db
+      .select({ id: dailyScores.id })
+      .from(dailyScores)
+      .where(and(eq(dailyScores.poolId, poolId), eq(dailyScores.gameDate, selectedDate)))
+      .limit(1);
+
+    if (!existingScore) {
+      try { await calculatePoolScores(poolId, selectedDate); } catch { /* non-fatal */ }
+    }
+  }
 
   // ── 7. Date-dependent queries (run in parallel) ──────────────────────────
 
-  const [selectedDateBreakdowns, poolTotalRows, activeDateRows, topPlayersRows] =
-    selectedDate
-      ? await Promise.all([
+  const [selectedDateBreakdowns, poolTotalRows, activeDateRows, activeDateTeamRows, totalStatsRows, topPlayersRows, goalieStatRows] =
+    await Promise.all([
           // Breakdown for selected date (points + goals/assists per member)
           db
             .select({
@@ -192,7 +234,9 @@ export default async function PoolPage({
             `
           ),
 
-          // Rostered players who played on the selected date
+          // Rostered players who have any stat on the selected date = actually played.
+          // Non-zero-only storage means scratched skaters and unused backup goalies
+          // have no rows, so they are correctly excluded from the "Played" badge.
           allPlayerIds.length > 0
             ? db
                 .selectDistinct({ playerId: nhlGameStats.playerId })
@@ -205,22 +249,60 @@ export default async function PoolPage({
                 )
             : Promise.resolve([]),
 
-          // Global top 5 NHL players by fantasy points, with G+A
+          // Teams that had any game on the selected date — used to determine
+          // whether a skater who has no stats was scratched vs. team didn't play.
+          db.execute(
+            sql`
+              SELECT DISTINCT np.team_id
+              FROM nhl_game_stats ngs
+              JOIN nhl_players np ON np.id = ngs.player_id
+              WHERE ngs.game_date = ${selectedDate}
+                AND np.team_id IS NOT NULL
+            `
+          ),
+
+          // Pool-lifetime per-player G+A from breakdown contributions (for total mode)
           db.execute(
             sql`
               SELECT
-                np.id          AS player_id,
+                ds.user_id,
+                entry.key AS player_id,
+                COALESCE(SUM(CASE WHEN contrib->>'statKey' = 'goals'
+                    THEN (contrib->>'statValue')::numeric ELSE 0 END), 0) AS goals,
+                COALESCE(SUM(CASE WHEN contrib->>'statKey' = 'assists'
+                    THEN (contrib->>'statValue')::numeric ELSE 0 END), 0) AS assists
+              FROM daily_scores ds,
+                   jsonb_each(ds.breakdown) AS entry(key, value),
+                   jsonb_array_elements(entry.value->'contributions') AS contrib
+              WHERE ds.pool_id = ${poolId}
+                AND ds.breakdown IS NOT NULL
+              GROUP BY ds.user_id, entry.key
+            `
+          ),
+
+          // Global top 5 NHL players by pool fantasy points for selected date
+          db.execute(
+            sql`
+              SELECT
+                np.id             AS player_id,
                 np.full_name,
                 np.position,
+                np.position_group,
                 np.team_id,
                 np.headshot_url,
                 SUM(CASE WHEN sr.id IS NOT NULL
                     THEN (ngs.stat_value * sr.points_value)::numeric
-                    ELSE 0 END) AS fantasy_points,
+                    ELSE 0 END)                                            AS fantasy_points,
                 SUM(CASE WHEN ngs.stat_key = 'goals'
-                    THEN ngs.stat_value::numeric ELSE 0 END) AS goals,
+                    THEN ngs.stat_value::numeric ELSE 0 END)              AS goals,
                 SUM(CASE WHEN ngs.stat_key = 'assists'
-                    THEN ngs.stat_value::numeric ELSE 0 END) AS assists
+                    THEN ngs.stat_value::numeric ELSE 0 END)              AS assists,
+                SUM(CASE WHEN ngs.stat_key = 'wins'
+                    THEN ngs.stat_value::numeric ELSE 0 END)              AS wins,
+                SUM(CASE WHEN ngs.stat_key = 'shutouts'
+                    THEN ngs.stat_value::numeric ELSE 0 END)              AS shutouts,
+                SUM(CASE WHEN ngs.stat_key = 'saves'
+                    THEN ngs.stat_value::numeric ELSE 0 END)              AS saves
               FROM nhl_game_stats ngs
               JOIN nhl_players np ON np.id = ngs.player_id
               LEFT JOIN scoring_rules sr
@@ -229,7 +311,7 @@ export default async function PoolPage({
                AND sr.position_group = np.position_group
                AND sr.is_enabled     = true
               WHERE ngs.game_date = ${selectedDate}
-              GROUP BY np.id, np.full_name, np.position, np.team_id, np.headshot_url
+              GROUP BY np.id, np.full_name, np.position, np.position_group, np.team_id, np.headshot_url
               HAVING SUM(CASE WHEN sr.id IS NOT NULL
                          THEN (ngs.stat_value * sr.points_value)::numeric
                          ELSE 0 END) > 0
@@ -237,8 +319,29 @@ export default async function PoolPage({
               LIMIT 5
             `
           ),
-        ])
-      : [[], [], [], []];
+
+          // Per-goalie stats for the selected date (wins, saves, goalsAgainst, shutouts)
+          goaliePlayerIds.length > 0
+            ? db.execute(
+                sql`
+                  SELECT
+                    ngs.player_id,
+                    SUM(CASE WHEN ngs.stat_key = 'wins'
+                        THEN ngs.stat_value ELSE 0 END) AS wins,
+                    SUM(CASE WHEN ngs.stat_key = 'saves'
+                        THEN ngs.stat_value ELSE 0 END) AS saves,
+                    SUM(CASE WHEN ngs.stat_key = 'goals_against'
+                        THEN ngs.stat_value ELSE 0 END) AS goals_against,
+                    SUM(CASE WHEN ngs.stat_key = 'shutouts'
+                        THEN ngs.stat_value ELSE 0 END) AS shutouts
+                  FROM nhl_game_stats ngs
+                  WHERE ngs.game_date = ${selectedDate}
+                    AND ngs.player_id IN ${sql`(${sql.join(goaliePlayerIds.map((id) => sql`${id}`), sql`, `)})`}
+                  GROUP BY ngs.player_id
+                `
+              )
+            : Promise.resolve([]),
+        ]);
 
   // ── 8. Build points maps ──────────────────────────────────────────────────
 
@@ -281,7 +384,30 @@ export default async function PoolPage({
     (poolTotalPoints[row.user_id] ??= {})[row.player_id] = Number(row.total_points);
   }
 
+  // Pool-lifetime per-player G+A (for total mode roster display)
+  const playerTotalStats: Record<string, Record<string, { goals: number; assists: number }>> = {};
+  for (const row of totalStatsRows as unknown as TotalStatsRow[]) {
+    (playerTotalStats[row.user_id] ??= {})[row.player_id] = {
+      goals:   Number(row.goals),
+      assists: Number(row.assists),
+    };
+  }
+
   const activeDateIds = activeDateRows.map((r) => r.playerId);
+  const activeDateTeamIds = (activeDateTeamRows as unknown as { team_id: string }[])
+    .map((r) => r.team_id)
+    .filter(Boolean);
+
+  // Per-goalie stats for the selected date
+  const goalieStats: Record<string, { wins: number; saves: number; goalsAgainst: number; shutouts: number }> = {};
+  for (const row of goalieStatRows as unknown as GoalieStatRow[]) {
+    goalieStats[String(row.player_id)] = {
+      wins:         Number(row.wins),
+      saves:        Number(row.saves),
+      goalsAgainst: Number(row.goals_against),
+      shutouts:     Number(row.shutouts),
+    };
+  }
 
   // ── 9. Normalize global top players ──────────────────────────────────────
 
@@ -291,11 +417,15 @@ export default async function PoolPage({
     playerId:      Number(r.player_id),
     fullName:      r.full_name,
     position:      r.position,
+    positionGroup: r.position_group,
     teamId:        r.team_id,
     headshotUrl:   r.headshot_url,
     fantasyPoints: Number(r.fantasy_points),
     goals:         Number(r.goals),
     assists:       Number(r.assists),
+    wins:          Number(r.wins),
+    shutouts:      Number(r.shutouts),
+    saves:         Number(r.saves),
   }));
 
   // ── 10. Serialize settings for client ────────────────────────────────────
@@ -327,9 +457,13 @@ export default async function PoolPage({
       selectedDate={selectedDate}
       selectedDatePoints={selectedDatePoints}
       playerStats={playerStats}
+      playerTotalStats={playerTotalStats}
       poolTotalPoints={poolTotalPoints}
       activeDateIds={activeDateIds}
-      availableDates={availableDates}
+      activeDateTeamIds={activeDateTeamIds}
+      goalieStats={goalieStats}
+      today={today}
+      isExplicitDate={isExplicitDate}
       dailyPointsMap={dailyPointsMap}
       globalTopPlayers={globalTopPlayers}
     />

@@ -7,9 +7,20 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { PlayerRow, SLOT_STYLE } from "./player-row";
-import type { PlayerRowData } from "./player-row";
+import type { PlayerRowData, GameStatus } from "./player-row";
 
 // ── Types ──────────────────────────────────────────────────────────────────
+
+type LivePlayerStat = {
+  goals: number;
+  assists: number;
+  poolPoints: number;
+  gameStatus: "live" | "played";
+  wins?: number;
+  saves?: number;
+  goalsAgainst?: number;
+  shutouts?: number;
+};
 
 export type RosterEntryData = {
   id: string;
@@ -53,8 +64,12 @@ type Props = {
   selectedDatePoints: Record<string, Record<string, number>>;
   poolTotalPoints: Record<string, Record<string, number>>;
   playerStats: Record<string, Record<string, { goals: number; assists: number }>>;
+  playerTotalStats: Record<string, Record<string, { goals: number; assists: number }>>;
   selectedDate: string | null;
   activeDateIds: number[];
+  activeDateTeamIds: string[];
+  goalieStats: Record<string, { wins: number; saves: number; goalsAgainst: number; shutouts: number }>;
+  today: string;
   settings: Settings;
 };
 
@@ -91,8 +106,12 @@ export function RosterView({
   selectedDatePoints,
   poolTotalPoints,
   playerStats,
+  playerTotalStats,
   selectedDate,
   activeDateIds,
+  activeDateTeamIds,
+  goalieStats,
+  today,
   settings,
 }: Props) {
   const [myEntries, setMyEntries] = useState<RosterEntryData[]>(
@@ -109,14 +128,51 @@ export function RosterView({
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // Live stats polling
+  const [liveStats, setLiveStats] = useState<Record<string, LivePlayerStat>>({});
+  const [teamSchedule, setTeamSchedule] = useState<Record<string, "live" | "played" | "later">>({});
+  const isToday = selectedDate === today;
+
+  useEffect(() => {
+    if (!isToday) {
+      setLiveStats({});
+      setTeamSchedule({});
+      return;
+    }
+
+    async function fetchLive() {
+      try {
+        const res = await fetch(`/api/v1/pools/${poolId}/live`);
+        if (!res.ok) return;
+        const json = await res.json();
+        if (json.data) {
+          setLiveStats(json.data.players ?? {});
+          setTeamSchedule(json.data.teamSchedule ?? {});
+        }
+      } catch {
+        // ignore network errors silently
+      }
+    }
+
+    fetchLive();
+    const interval = setInterval(fetchLive, 60_000);
+    return () => clearInterval(interval);
+  }, [isToday, poolId]);
+
   const isMyRoster = selectedMemberId === currentUserId;
   const canEdit = isMyRoster && poolStatus === "setup";
   const hasScoring = selectedDate !== null;
   const activeDateSet = new Set(activeDateIds);
+  const activeTeamSet = new Set(activeDateTeamIds);
 
-  const displayedEntries: RosterEntryData[] = isMyRoster
+  const displayedEntries: RosterEntryData[] = (isMyRoster
     ? myEntries
-    : (allRosters[selectedMemberId] ?? []);
+    : (allRosters[selectedMemberId] ?? [])
+  ).slice().sort((a, b) => {
+    const aGoalie = a.playerPositionGroup === "goalie" ? 1 : 0;
+    const bGoalie = b.playerPositionGroup === "goalie" ? 1 : 0;
+    return aGoalie - bGoalie;
+  });
 
   const slotMap = myEntries.reduce<Record<string, number>>((acc, e) => {
     acc[e.rosterSlot] = (acc[e.rosterSlot] ?? 0) + 1;
@@ -129,22 +185,59 @@ export function RosterView({
 
   function getPoints(entry: RosterEntryData): number | undefined {
     if (!hasScoring) return undefined;
+    if (isToday && pointsMode === "date") {
+      return liveStats[String(entry.playerId)]?.poolPoints ?? 0;
+    }
     const map = pointsMode === "date" ? selectedDatePoints : poolTotalPoints;
     return map[entry.userId]?.[String(entry.playerId)] ?? 0;
   }
 
   function getStats(
     entry: RosterEntryData
-  ): { goals: number; assists: number } | undefined {
-    if (pointsMode !== "date" || !hasScoring) return undefined;
-    if (!activeDateSet.has(entry.playerId)) return undefined;
+  ): { goals: number; assists: number; wins?: number; saves?: number; goalsAgainst?: number; shutouts?: number } | undefined {
+    if (!hasScoring) return undefined;
+    const isGoalie = entry.playerPositionGroup === "goalie";
+    if (isToday && pointsMode === "date") {
+      const live = liveStats[String(entry.playerId)];
+      if (isGoalie) {
+        return { goals: 0, assists: 0, wins: live?.wins, saves: live?.saves, goalsAgainst: live?.goalsAgainst, shutouts: live?.shutouts };
+      }
+      return { goals: live?.goals ?? 0, assists: live?.assists ?? 0 };
+    }
+    if (isGoalie) {
+      if (pointsMode === "total") return { goals: 0, assists: 0 };
+      const gs = goalieStats[String(entry.playerId)];
+      return { goals: 0, assists: 0, wins: gs?.wins, saves: gs?.saves, goalsAgainst: gs?.goalsAgainst, shutouts: gs?.shutouts };
+    }
+    if (pointsMode === "total") {
+      const s = playerTotalStats[entry.userId]?.[String(entry.playerId)];
+      return { goals: s?.goals ?? 0, assists: s?.assists ?? 0 };
+    }
+    // date mode — always return stats (0/0 if player didn't play that day)
     const s = playerStats[entry.userId]?.[String(entry.playerId)];
     return { goals: s?.goals ?? 0, assists: s?.assists ?? 0 };
   }
 
-  function getIsActive(entry: RosterEntryData): boolean | undefined {
-    if (!hasScoring || pointsMode !== "date") return undefined;
-    return activeDateSet.has(entry.playerId);
+  function getGameStatus(entry: RosterEntryData): GameStatus {
+    if (!hasScoring || pointsMode !== "date") return null;
+    const isSkater = entry.playerPositionGroup !== "goalie";
+    if (isToday) {
+      const live = liveStats[String(entry.playerId)];
+      if (live) {
+        // Player appeared in the live boxscore (and for goalies, actually entered the game)
+        return live.gameStatus;
+      }
+      const teamStatus = entry.playerTeamId ? teamSchedule[entry.playerTeamId] : undefined;
+      if (teamStatus === "later") return "later";
+      // Team game is live or finished but player isn't in boxscore → scratched (skaters only)
+      if (teamStatus && isSkater) return "scratched";
+      return null;
+    }
+    // Historical: player has stat rows = actually played
+    if (activeDateSet.has(entry.playerId)) return "played";
+    // Team played but skater has no stats → scratched
+    if (isSkater && entry.playerTeamId && activeTeamSet.has(entry.playerTeamId)) return "scratched";
+    return null;
   }
 
   // ── My roster refetch ────────────────────────────────────────────────────
@@ -312,6 +405,7 @@ export function RosterView({
                 playerId: entry.playerId,
                 playerFullName: entry.playerFullName,
                 playerPosition: entry.playerPosition,
+                playerPositionGroup: entry.playerPositionGroup,
                 playerTeamId: entry.playerTeamId,
                 playerHeadshotUrl: entry.playerHeadshotUrl,
                 rosterSlot: entry.rosterSlot,
@@ -322,7 +416,7 @@ export function RosterView({
                   entry={rowData}
                   points={getPoints(entry)}
                   stats={getStats(entry)}
-                  isActive={getIsActive(entry)}
+                  gameStatus={getGameStatus(entry)}
                   acquiredDate={entry.addedAt}
                   pointsMode={pointsMode}
                   onRemove={canEdit ? handleRemove : undefined}
